@@ -51,6 +51,9 @@ head(abd)
 for (r in c("occ", "count")) {
   
   cat(r, "\n")
+  
+  rfull <- if (r == "occ") { "occurrence" } else { "count"}
+  
 
   #### GET TOP ENV PREDICTORS  ###################################################
   
@@ -67,42 +70,48 @@ for (r in c("occ", "count")) {
 
 #### PREPARE DATA & DIRECTORIES FOR GAM ANALYSIS ###############################
 
-  rfull <- if (r == "occ") { "occurrence" } else { "count"}
-  
-  # select columns from full srd dataset
-  srd <- select(srd_import, c("srd_id", "latitude", "longitude", pred_names)) 
-  
-
   # > directories ----------------------------------------------------------------
   experiment_label <- glue("{r}/sc{j}") #(experiment_label <- glue("full_{r}_2")) # comment this back on
   #experiment_label <- glue("{r}/test_public_repo")
   dir_int <- here("intermediates",dml_label, "gam", experiment_label)
   fs::dir_create(dir_int)
+  
+  # > data  --------------------------------------------------------------------
+  
+  # load cate data
+  #folds <- c(1:100)
+  cates <- arrow::read_parquet(here(dir_res, glue("{r}_cates.parquet"))) %>% 
+    filter(scenario == j) #, fold %in% folds)
+  
+  # select columns from full srd dataset
+  srd <- select(srd_import, c("srd_id", "latitude", "longitude", pred_names)) 
 
 
-    # > check correlations ---------------------------------------------------------------
-    cor_mat <- srd %>% 
-      select(., -c(srd_id, latitude, longitude)) %>% 
-      cor(., method = "pearson") 
+  # > check correlations ---------------------------------------------------------------
+  
+  cor_mat <- srd %>% 
+    select(., -c(srd_id, latitude, longitude)) %>% 
+    cor(., method = "pearson") 
     
-    corpiv <- pivot_longer(as_tibble(cor_mat) %>% mutate(var=row.names(cor_mat)), cols = 1:ncol(cor_mat)) %>% 
-      mutate(value = as.numeric(value)) %>% 
-      rename(var1 = var, var2 = name) %>%
-      filter(var1 != var2, var1 != "fold", var2 != "fold") %>% 
-      mutate(pair_id = paste(pmin(var1, var2), pmax(var1, var2), sep = "_")) %>%
-      distinct(pair_id, .keep_all = TRUE) %>%
-      select(-pair_id) %>% 
-      arrange(desc(abs(value)))
+  corpiv <- pivot_longer(as_tibble(cor_mat) %>% mutate(var=row.names(cor_mat)), cols = 1:ncol(cor_mat)) %>% 
+    mutate(value = as.numeric(value)) %>% 
+    rename(var1 = var, var2 = name) %>%
+    filter(var1 != var2, var1 != "fold", var2 != "fold") %>% 
+    mutate(pair_id = paste(pmin(var1, var2), pmax(var1, var2), sep = "_")) %>%
+    distinct(pair_id, .keep_all = TRUE) %>%
+    select(-pair_id) %>% 
+    arrange(desc(abs(value)))
     
-    rm(cor_mat)
-    head(corpiv)
+  rm(cor_mat)
+  head(corpiv)
     
-    maxcor <- nrow(filter(corpiv, value >= 0.6))
-    cat(r, "preds with corr > 0.6 =", maxcor, "\n")
+  maxcor <- nrow(filter(corpiv, value >= 0.6))
+  cat(r, "preds with corr > 0.6 =", maxcor, "\n")
 
     
-    # > check for sufficient variation ---------------------------------------------
-    pred_unique <- as.data.frame(NA)
+  # > check for sufficient variation ---------------------------------------------
+  
+  pred_unique <- as.data.frame(NA)
     
     for (iii in 1:ncol(srd)){
       pred_unique[iii] <- length(unique(srd[ , names(srd)[iii]]))
@@ -119,7 +128,12 @@ for (r in c("occ", "count")) {
 
 
 #### RUN GAM ###################################################################
-
+   
+  # > set up output objects ----------------------------------------------------
+  gam.summaries <- as.data.frame(matrix(nrow = 0, ncol = length(pred_names)+3))
+  colnames(gam.summaries) <- c("fold", "metric", pred_names, "latlon")
+  r.sq <- NULL
+    
   # > model formula ------------------------------------------------------------  
   model_name <- NULL
   for (iii in 1:length(pred_names)){                      # for each predictor
@@ -134,26 +148,14 @@ for (r in c("occ", "count")) {
   rm(corpiv, top, iii, maxcor) 
   
   
-  # > set up output objects ----------------------------------------------------
-  gam.summaries <- as.data.frame(matrix(nrow = 0, ncol = length(pred_names)+3))
-  colnames(gam.summaries) <- c("fold", "metric", pred_names, "latlon")
-  r.sq <- NULL
-  
-  
-  # > load cate data -----------------------------------------------------------
-  cates <- arrow::read_parquet(here(dir_res, glue("{r}_cates.parquet"))) %>% 
-    filter(scenario == j, fold %in% folds)
-  
-  
   # > loop over folds (begin i loop) -------------------------------------------
   
-  folds <- c(1:100)
-  
-  for (i in unique(cates$fold)) {
+    for (i in unique(cates$fold)) {
     
     cat("fold ", i, "\n")
     
     tic()
+    
     cates_i <- filter(cates, fold == i)
     
     
@@ -191,7 +193,6 @@ for (r in c("occ", "count")) {
     r.sq <- rbind(r.sq, r.sq.i)
     
     
-    
     #### PREDICT INDIVIDUAL FEATURE EFFECTS ###########################################################
     
     pred  <- predict.gam(d.gam,type = "iterms", se.fit = TRUE) # iterms gives the parts of the prediction ("How much is s(x1) contributing here?"); type = "response" gives total prediction (sum of all contributions).
@@ -216,7 +217,7 @@ beep(1)
 
 
 
-#### SAVE RESULTS ##############################################################
+#### SAVE MODEL RESULTS ##############################################################
 
 saveRDS(effect_plotting, here(dir_int, glue("effect_plotting_folds{min(folds)}-{max(folds)}.rds")))
 saveRDS(gam.summaries, here(dir_int, glue("gam-summaries_folds{min(folds)}-{max(folds)}.rds")))
