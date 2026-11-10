@@ -3,7 +3,7 @@
 #### SET-UP ####################################################################
 
 # > packages -------------------------------------------------------------------
-packages <- c("arrow","beepr","dplyr","ebirdst","fs","glue","here","mgcv","sf",
+packages <- c("arrow","beepr","dplyr","ebirdst","fs","glue","here","mgcv", 
               "terra","tictoc","tidyverse")
 invisible(lapply(packages, library, character.only = TRUE))
 rm(packages)
@@ -14,23 +14,28 @@ dml_label <- "hpc2"
 j <- 1
 min_ss <- 30
 
+# nuisance variables -- list of vars not to include for GAM analysis
+nuisance <- c("eastness","northness","elevation","elevation_sd","northness_sd","eastness_sd")
+
 
 # > directories ----------------------------------------------------------------
 dir_data <- here("data","tidy")
 dir_res <- here("results", dml_label)
 
 
-# > load tidy data ------------------------------------------------------------------
+#### LOAD DATA #################################################################
+
+# variable importance
 vi <- arrow::read_parquet(here(dir_res, "vis.parquet")) %>% 
   filter(., model == "treatment", scenario == j) %>% 
   mutate(response = ifelse(response == "occurrence", "occ", response)); tail(vi)
 
+# environmental variables 
 srd_import <- readRDS(here(dir_data, "srd_tidy_2026-03-10.rds")) %>%  
   select(., c("srd_id", "year", "latitude", "longitude", unique(vi$predictor))) 
 
 
-# load eBird relative abundance to join to final partial-effect dataframe
-ebirdst_data_dir()
+# eBird relative abundance (to join to final partial-effect dataframe)
 abd_rast <- load_raster("pinjay",
                         product = "abundance",
                         period = "seasonal",
@@ -42,17 +47,14 @@ abd <- as.data.frame(abd_rast, xy = TRUE, cells = TRUE) %>%
 head(abd)
 
 
-#### GET TOP ENV PREDICTORS  ###################################################
-
-# list of predictors to not consider for GAM analysis
-nuisance <- c("eastness", "northness", "elevation", "elevation_sd",
-              "northness_sd", "eastness_sd")
-
-
+# start r loop --------
 for (r in c("occ", "count")) {
   
   cat(r, "\n")
+
+  #### GET TOP ENV PREDICTORS  ###################################################
   
+  # get 15 most important variables from DML trend analysis, excluding nuisance vars
   top <- dplyr::filter(vi, response == r, !(predictor %in% nuisance)) %>%
     group_by(predictor) %>%
     summarize(med = median(importance_sc)) %>%
@@ -65,20 +67,20 @@ for (r in c("occ", "count")) {
 
 #### PREPARE DATA & DIRECTORIES FOR GAM ANALYSIS ###############################
 
-  experiment_label <- glue("{r}/sc{j}") #(experiment_label <- glue("full_{r}_2")) # comment this back on
-  #experiment_label <- glue("{r}/test_public_repo")
   rfull <- if (r == "occ") { "occurrence" } else { "count"}
   
+  # select columns from full srd dataset
   srd <- select(srd_import, c("srd_id", "latitude", "longitude", pred_names)) 
   
 
   # > directories ----------------------------------------------------------------
+  experiment_label <- glue("{r}/sc{j}") #(experiment_label <- glue("full_{r}_2")) # comment this back on
+  #experiment_label <- glue("{r}/test_public_repo")
   dir_int <- here("intermediates",dml_label, "gam", experiment_label)
-
   fs::dir_create(dir_int)
 
 
-    # > correlations ---------------------------------------------------------------
+    # > check correlations ---------------------------------------------------------------
     cor_mat <- srd %>% 
       select(., -c(srd_id, latitude, longitude)) %>% 
       cor(., method = "pearson") 
@@ -118,6 +120,7 @@ for (r in c("occ", "count")) {
 
 #### RUN GAM ###################################################################
 
+  # > model formula ------------------------------------------------------------  
   model_name <- NULL
   for (iii in 1:length(pred_names)){                      # for each predictor
     model_name[iii] <- 
@@ -130,19 +133,21 @@ for (r in c("occ", "count")) {
   
   rm(corpiv, top, iii, maxcor) 
   
-  # set up objects to receive outputs
+  
+  # > set up output objects ----------------------------------------------------
   gam.summaries <- as.data.frame(matrix(nrow = 0, ncol = length(pred_names)+3))
   colnames(gam.summaries) <- c("fold", "metric", pred_names, "latlon")
   r.sq <- NULL
   
-  gc()
   
-  # > begin for loops ------------------------------------------------------------
-  
-  folds <- c(1:100)
-  
+  # > load cate data -----------------------------------------------------------
   cates <- arrow::read_parquet(here(dir_res, glue("{r}_cates.parquet"))) %>% 
     filter(scenario == j, fold %in% folds)
+  
+  
+  # > loop over folds (begin i loop) -------------------------------------------
+  
+  folds <- c(1:100)
   
   for (i in unique(cates$fold)) {
     
@@ -150,6 +155,7 @@ for (r in c("occ", "count")) {
     
     tic()
     cates_i <- filter(cates, fold == i)
+    
     
     # > join cates and srd -------------------------------------------------------
     D <- inner_join(select(cates_i, c(fold, srd_id, cate_pred)), srd, by = "srd_id")
@@ -165,10 +171,8 @@ for (r in c("occ", "count")) {
       discrete = T, 
       data = D)
     
-    #save(d.gam, file = here(dir_int, "model.RData"))
-    
-    
-    # > summarize ------------------------------------------------------------------
+
+    # > summarize --------------------------------------------------------------
     
     # F and p value from each fold
     d.sum <- summary(d.gam)
@@ -182,11 +186,10 @@ for (r in c("occ", "count")) {
     names(d.add) <- names(gam.summaries)                   # assign column names
     gam.summaries <- rbind(gam.summaries, d.add)           # add gam results for fold i to full gam.summaries table
     
-    # R2 and deviance explained from each fold
+    # r^2 and deviance explained from each fold
     r.sq.i <- cbind(fold = i, r.sq = d.sum$r.sq, dev.expl = d.sum$dev.expl * 100)
     r.sq <- rbind(r.sq, r.sq.i)
     
-    gc()
     
     
     #### PREDICT INDIVIDUAL FEATURE EFFECTS ###########################################################
@@ -220,13 +223,9 @@ saveRDS(gam.summaries, here(dir_int, glue("gam-summaries_folds{min(folds)}-{max(
 saveRDS(r.sq, here(dir_int, glue("r-sq_folds{min(folds)}-{max(folds)}.rds")))
 
 
-rm(r.sq.i, D, d.sum, cates)
+rm(r.sq.i, D, d.sum, cates, gam.summaries, r.sq)
 gc()
 
-
-#} # {end b loop} ----
-
-rm(gam.summaries, r.sq)
 
 
 #### PREPARE MEAN DATAFRAME ####################################################
@@ -253,12 +252,12 @@ rm(effect_1D_mean, effect_plotting)
 gc()
 
 
-} # end r loop
+} # end r loop ----
 
 
 
 
-#### END OF CODE FOR MANUSCRIPT ################################################
+#### <<<< END OF CODE FOR MANUSCRIPT >>>> ######################################
 
 #### FOR CREATING THE MEAN EFFECT DF ONLY ######################################
 
